@@ -1,0 +1,241 @@
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using System;
+
+using NUnit.Framework;
+
+using Moq;
+
+
+// Domain Interfaces
+public interface IOrder
+{
+    int OrderId { get; set; }
+    string CustomerEmail { get; set; }
+    decimal TotalAmount { get; set; }
+    IList<IOrderItem> Items { get; set; }
+    OrderStatus Status { get; set; }
+}
+
+public interface IOrderItem
+{
+    int ProductId { get; set; }
+    int Quantity { get; set; }
+    decimal UnitPrice { get; set; }
+}
+
+public interface IProduct
+{
+    int ProductId { get; set; }
+    string Name { get; set; }
+    decimal Price { get; set; }
+    int StockQuantity { get; set; }
+}
+
+// Domain Implementations
+public class Order : IOrder
+{
+    public int OrderId { get; set; }
+    public string CustomerEmail { get; set; }
+    public decimal TotalAmount { get; set; }
+    private IList<IOrderItem> _items = new List<IOrderItem>();
+    public IList<IOrderItem> Items 
+    { 
+        get => _items;
+        set => _items = value;
+    }
+    public OrderStatus Status { get; set; }
+}
+
+public class OrderItem : IOrderItem
+{
+    public int ProductId { get; set; }
+    public int Quantity { get; set; }
+    public decimal UnitPrice { get; set; }
+}
+
+public class Product : IProduct
+{
+    public int ProductId { get; set; }
+    public string Name { get; set; }
+    public decimal Price { get; set; }
+    public int StockQuantity { get; set; }
+}
+
+// Service interfaces and implementations remain the same
+public interface IOrderRepository
+{
+    Task<IOrder> GetOrderByIdAsync(int orderId);
+    Task<bool> SaveOrderAsync(IOrder order);
+    Task<IEnumerable<IOrder>> GetCustomerOrdersAsync(string customerEmail);
+}
+
+public interface IProductRepository
+{
+    Task<IProduct> GetProductByIdAsync(int productId);
+    Task<bool> UpdateStockAsync(int productId, int newQuantity);
+}
+
+public interface IEmailService
+{
+    Task SendOrderConfirmationAsync(IOrder order);
+    Task SendOrderShippedNotificationAsync(IOrder order);
+}
+public enum OrderStatus
+{
+    Pending,
+    Confirmed,
+    Shipped,
+    Delivered,
+    Cancelled
+}
+// Service Implementation
+public class OrderService
+{
+    private readonly IOrderRepository _orderRepository;
+    private readonly IProductRepository _productRepository;
+    private readonly IEmailService _emailService;
+
+    public OrderService(
+        IOrderRepository orderRepository,
+        IProductRepository productRepository,
+        IEmailService emailService)
+    {
+        _orderRepository = orderRepository;
+        _productRepository = productRepository;
+        _emailService = emailService;
+    }
+
+    public async Task<bool> PlaceOrderAsync(IOrder order)
+    {
+        foreach (var item in order.Items)
+        {
+            var product = await _productRepository.GetProductByIdAsync(item.ProductId);
+            if (product.StockQuantity < item.Quantity)
+                return false;
+        }
+
+        foreach (var item in order.Items)
+        {
+            var product = await _productRepository.GetProductByIdAsync(item.ProductId);
+            await _productRepository.UpdateStockAsync(item.ProductId, 
+                product.StockQuantity - item.Quantity);
+        }
+
+        order.Status = OrderStatus.Confirmed;
+        var saved = await _orderRepository.SaveOrderAsync(order);
+
+        if (saved)
+        {
+            await _emailService.SendOrderConfirmationAsync(order);
+        }
+
+        return saved;
+    }
+
+    public async Task<bool> ShipOrderAsync(int orderId)
+    {
+        var order = await _orderRepository.GetOrderByIdAsync(orderId);
+        if (order == null || order.Status != OrderStatus.Confirmed)
+            return false;
+
+        order.Status = OrderStatus.Shipped;
+        var updated = await _orderRepository.SaveOrderAsync(order);
+
+        if (updated)
+        {
+            await _emailService.SendOrderShippedNotificationAsync(order);
+        }
+
+        return updated;
+    }
+}
+
+// Unit Tests
+[TestFixture]
+public class OrderServiceTests
+{
+    private Mock<IOrderRepository> _orderRepositoryMock;
+    private Mock<IProductRepository> _productRepositoryMock;
+    private Mock<IEmailService> _emailServiceMock;
+    private Mock<IOrder> _orderMock;
+    private Mock<IProduct> _productMock;
+    private Mock<IOrderItem> _orderItemMock;
+    private OrderService _orderService;
+
+    [SetUp]
+    public void Setup()
+    {
+        _orderRepositoryMock = new Mock<IOrderRepository>();
+        _productRepositoryMock = new Mock<IProductRepository>();
+        _emailServiceMock = new Mock<IEmailService>();
+        _orderMock = new Mock<IOrder>();
+        _productMock = new Mock<IProduct>();
+        _orderItemMock = new Mock<IOrderItem>();
+
+        _orderService = new OrderService(
+            _orderRepositoryMock.Object,
+            _productRepositoryMock.Object,
+            _emailServiceMock.Object
+        );
+    }
+
+    [Test]
+    public async Task PlaceOrder_WithSufficientStock_ShouldSucceed()
+    {
+        // Arrange
+        _orderItemMock.Setup(i => i.ProductId).Returns(1);
+        _orderItemMock.Setup(i => i.Quantity).Returns(2);
+
+        _orderMock.Setup(o => o.OrderId).Returns(1);
+        _orderMock.Setup(o => o.CustomerEmail).Returns("test@example.com");
+        _orderMock.Setup(o => o.Items).Returns(new List<IOrderItem> { _orderItemMock.Object });
+
+        _productMock.Setup(p => p.ProductId).Returns(1);
+        _productMock.Setup(p => p.StockQuantity).Returns(5);
+
+        _productRepositoryMock.Setup(x => x.GetProductByIdAsync(1))
+            .ReturnsAsync(_productMock.Object);
+        _productRepositoryMock.Setup(x => x.UpdateStockAsync(It.IsAny<int>(), It.IsAny<int>()))
+            .ReturnsAsync(true);
+        _orderRepositoryMock.Setup(x => x.SaveOrderAsync(It.IsAny<IOrder>()))
+            .ReturnsAsync(true);
+        _emailServiceMock.Setup(x => x.SendOrderConfirmationAsync(It.IsAny<IOrder>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var result = await _orderService.PlaceOrderAsync(_orderMock.Object);
+
+        // Assert
+        Assert.That(result, Is.True);
+        _orderRepositoryMock.Verify(x => x.SaveOrderAsync(It.Is<IOrder>(o => 
+            o.Status == OrderStatus.Confirmed)), Times.Once);
+        _emailServiceMock.Verify(x => x.SendOrderConfirmationAsync(_orderMock.Object), Times.Once);
+    }
+
+    [Test]
+    public async Task PlaceOrder_WithInsufficientStock_ShouldFail()
+    {
+        // Arrange
+        _orderItemMock.Setup(i => i.ProductId).Returns(1);
+        _orderItemMock.Setup(i => i.Quantity).Returns(10);
+
+        _orderMock.Setup(o => o.OrderId).Returns(1);
+        _orderMock.Setup(o => o.CustomerEmail).Returns("test@example.com");
+        _orderMock.Setup(o => o.Items).Returns(new List<IOrderItem> { _orderItemMock.Object });
+
+        _productMock.Setup(p => p.ProductId).Returns(1);
+        _productMock.Setup(p => p.StockQuantity).Returns(5);
+
+        _productRepositoryMock.Setup(x => x.GetProductByIdAsync(1))
+            .ReturnsAsync(_productMock.Object);
+
+        // Act
+        var result = await _orderService.PlaceOrderAsync(_orderMock.Object);
+
+        // Assert
+        Assert.That(result, Is.False);
+        _orderRepositoryMock.Verify(x => x.SaveOrderAsync(It.IsAny<IOrder>()), Times.Never);
+        _emailServiceMock.Verify(x => x.SendOrderConfirmationAsync(It.IsAny<IOrder>()), Times.Never);
+    }
+}
